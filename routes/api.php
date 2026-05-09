@@ -14,8 +14,17 @@ use Illuminate\Support\Facades\Route;
 |
 */
 
-Route::post('/game/start', [\App\Http\Controllers\API\GameController::class, 'startSession']);
-Route::post('/game/submit', [\App\Http\Controllers\API\GameController::class, 'submitScore']);
+Route::post('/auth/register', [\App\Http\Controllers\API\AuthController::class, 'register']);
+Route::post('/auth/login', [\App\Http\Controllers\API\AuthController::class, 'login']);
+
+Route::middleware('auth:sanctum')->group(function () {
+	Route::get('/auth/me', [\App\Http\Controllers\API\AuthController::class, 'me']);
+	Route::post('/auth/logout', [\App\Http\Controllers\API\AuthController::class, 'logout']);
+
+	Route::post('/game/start', [\App\Http\Controllers\API\GameController::class, 'startSession']);
+	Route::post('/game/submit', [\App\Http\Controllers\API\GameController::class, 'submitScore']);
+});
+
 Route::get('/game/leaderboard', [\App\Http\Controllers\API\GameController::class, 'getLeaderboard']);
 
 Route::get('chapters', [\App\Http\Controllers\ChapterController::class, 'index']);

@@ -42,6 +42,8 @@ Backend ini adalah layanan REST API murni yang dibangun dengan Laravel untuk men
 
 ## 📖 Dokumentasi API
 
+Base URL: `http://<host>:8000/api`
+
 ### 1. Data Al-Qur'an (Public)
 | Method | Endpoint | Deskripsi |
 | :--- | :--- | :--- |
@@ -49,38 +51,54 @@ Backend ini adalah layanan REST API murni yang dibangun dengan Laravel untuk men
 | `GET` | `/api/surah/{id}` | Ambil semua ayat dalam surah tertentu. |
 | `GET` | `/api/audio/{reciter}/{chapter}/{verse}` | Ambil URL audio spesifik untuk satu ayat. |
 
-### 2. Game System (Auth Protected)
-*Wajib menyertakan header: `Authorization: Bearer <your_token>`*
+### 2. Authentication
+| Method | Endpoint | Deskripsi |
+| :--- | :--- | :--- |
+| `POST` | `/api/auth/register` | Registrasi akun baru + token Sanctum. |
+| `POST` | `/api/auth/login` | Login + token Sanctum. |
+| `GET` | `/api/auth/me` | Ambil profil user login. (Auth) |
+| `POST` | `/api/auth/logout` | Logout token saat ini. (Auth) |
+
+### 3. Game System
+*Endpoint di bawah (kecuali leaderboard) wajib menyertakan header: `Authorization: Bearer <your_token>`*
 
 | Method | Endpoint | Deskripsi |
 | :--- | :--- | :--- |
-| `POST` | `/api/game/start` | Mulai sesi kuis. Mengembalikan ayat acak beserta 3 pilihan pengecoh. |
-| `POST` | `/api/game/submit` | Kirim skor setelah menyelesaikan kuis. Jika `is_perfect: true`, status level surah menjadi Lulus. |
+| `POST` | `/api/game/start` | Mulai sesi kuis (mode all_juz / juz / surah), jumlah soal 5/10/20, opsi 4 pilihan. |
+| `POST` | `/api/game/submit` | Submit jawaban per soal. Skor, combo, streak dihitung server-side (anti-cheat). |
 | `GET` | `/api/game/leaderboard` | Ambil daftar 50 pemain dengan poin tertinggi. |
 
 #### Contoh Request `POST /api/game/start`:
 ```json
 {
-    "chapter_id": 1,
-    "jumlah_soal": 5
+   "mode": "surah",
+   "surah_ids": [1, 2, 3],
+   "jumlah_soal": 10,
+   "reciter_id": 7
 }
 ```
+
+Pilihan mode:
+- `all_juz` = acak dari seluruh Quran
+- `juz` = acak dari juz tertentu (wajib `juz` 1-30)
+- `surah` = acak dari daftar beberapa surah (`surah_ids`)
 
 #### Contoh Request `POST /api/game/submit`:
 ```json
 {
-    "score": 1200,
-    "streak": 7,
-    "combo": 3,
-    "surah_id": 1,
-    "is_perfect": true
+   "session_id": 12,
+   "answers": [
+      {"question_id": 1001, "selected_verse_id": 5012},
+      {"question_id": 1002, "selected_verse_id": 6011}
+   ]
 }
 ```
 
 ## 🎮 Mekanik Game
-1. **Pengecekkan Progres:** Saat memanggil `/api/game/start`, sistem akan mengecek apakah surah sebelumnya sudah lulus (`is_passed`).
-2. **Pengecoh (Options):** API secara otomatis mencarikan 3 ayat lain dari surah/juz yang sama sebagai pilihan jawaban salah di Android.
-3. **Leaderboard:** Skor bersifat akumulatif. Semakin sering bermain dan benar, semakin tinggi peringkat user.
+1. **Mode Soal:** all_juz, per-juz, atau multi-surah acak.
+2. **Progression:** untuk mode surah, surah berikutnya terkunci sampai surah sebelumnya lulus (perfect).
+3. **Scoring Server-side:** client hanya kirim jawaban; score/combo/streak dihitung di backend.
+4. **Leaderboard:** skor bersifat akumulatif lintas sesi.
 
 ## 📁 Struktur Penting
 - `app/Http/Controllers/API/GameController.php`: Logika utama game.
