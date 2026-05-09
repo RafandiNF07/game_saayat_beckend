@@ -42,6 +42,9 @@ class GameController extends Controller
         }
 
         if ($mode === 'surah') {
+            // FindBlockedChapter removed to allow free play
+            $blockedChapter = null; 
+            /*
             $blockedChapter = $this->findBlockedChapter($user->id, $surahIds);
             if ($blockedChapter !== null) {
                 return response()->json([
@@ -52,6 +55,7 @@ class GameController extends Controller
                     ],
                 ], 403);
             }
+            */
         }
 
         $baseQuery = Verse::query();
@@ -63,7 +67,18 @@ class GameController extends Controller
 
         $this->applyScope($baseQuery, $mode, $juzNumber, $surahIds);
 
-        $availableCount = (clone $baseQuery)->count();
+        $orderedVerses = (clone $baseQuery)
+            ->with(['chapter', 'audio' => function ($q) use ($reciterId) {
+                $q->where('id_recitation', $reciterId);
+            }])
+            ->orderBy('id_chapter')
+            ->orderBy('number')
+            ->get()
+            ->values();
+
+        $eligiblePrompts = $orderedVerses->slice(0, max(0, $orderedVerses->count() - 1))->values();
+        $availableCount = $eligiblePrompts->count();
+
         if ($availableCount < $jumlahSoal) {
             return response()->json([
                 'status' => 'error',
@@ -75,15 +90,9 @@ class GameController extends Controller
             ], 422);
         }
 
-        $selectedVerses = (clone $baseQuery)
-            ->with(['audio' => function ($q) use ($reciterId) {
-                $q->where('id_recitation', $reciterId);
-            }])
-            ->inRandomOrder()
-            ->limit($jumlahSoal)
-            ->get();
+        $selectedVerses = $eligiblePrompts->shuffle()->take($jumlahSoal)->values();
 
-        $session = DB::transaction(function () use ($user, $mode, $scope, $jumlahSoal, $reciterId, $selectedVerses, $baseQuery) {
+        $session = DB::transaction(function () use ($user, $mode, $scope, $jumlahSoal, $reciterId, $selectedVerses, $orderedVerses) {
             $session = GameSession::create([
                 'user_id' => $user->id,
                 'mode' => $mode,
@@ -95,7 +104,8 @@ class GameController extends Controller
             ]);
 
             foreach ($selectedVerses->values() as $index => $verse) {
-                $optionVerseIds = $this->buildOptions((clone $baseQuery), $verse->id);
+                $nextVerseId = $this->findNextVerseIdInOrderedScope($orderedVerses, $verse->id);
+                $optionVerseIds = $this->buildContinuationOptions($orderedVerses, $verse->id, $nextVerseId);
 
                 GameSessionQuestion::create([
                     'game_session_id' => $session->id,
@@ -110,20 +120,17 @@ class GameController extends Controller
 
         $responseQuestions = GameSessionQuestion::query()
             ->where('game_session_id', $session->id)
-            ->with('verse')
-            ->orderBy('question_order')
+            ->with(['verse.chapter'])
             ->get()
-            ->map(function (GameSessionQuestion $question) use ($reciterId) {
+            ->map(function (GameSessionQuestion $question) use ($reciterId, $orderedVerses) {
                 $verse = $question->verse;
-                $audioUrl = Verse::query()
-                    ->where('id', $verse->id)
-                    ->with(['audio' => function ($q) use ($reciterId) {
-                        $q->where('id_recitation', $reciterId);
-                    }])
-                    ->first()?->audio?->url;
+                $nextVerseId = $this->findNextVerseIdInOrderedScope($orderedVerses, $verse->id);
+                $promptTranslation = DB::table('verse_translations')->where('id_verse', $verse->id)->where('id_translation', 33)->value('text') ?? '';
+                $audioUrl = optional($verse->audio()->where('id_recitation', $reciterId)->first())->url;
 
                 $options = Verse::query()
                     ->whereIn('id', $question->option_verse_ids)
+                    ->with('chapter')
                     ->get()
                     ->sortBy(function ($option) use ($question) {
                         return array_search($option->id, $question->option_verse_ids, true);
@@ -134,6 +141,7 @@ class GameController extends Controller
                             'verse_id' => $option->id,
                             'text' => $option->text_uthmani,
                             'surah_id' => $option->id_chapter,
+                            'surah_name' => optional($option->chapter)->name,
                             'verse_number' => $option->number,
                         ];
                     })
@@ -142,9 +150,14 @@ class GameController extends Controller
                 return [
                     'question_id' => $question->id,
                     'order' => $question->question_order,
+                    'verse_id' => $verse->id,
+                    'text' => $verse->text_uthmani,
                     'surah_id' => $verse->id_chapter,
+                    'surah_name' => optional($verse->chapter)->name,
                     'verse_number' => $verse->number,
                     'audio_url' => $audioUrl,
+                    'translation_text' => $promptTranslation,
+                    'next_verse_id' => $nextVerseId,
                     'options' => $options,
                 ];
             });
@@ -215,10 +228,14 @@ class GameController extends Controller
             ], 422);
         }
 
-        DB::transaction(function () use ($validated, $questionMap) {
+        $orderedVerses = $this->getOrderedScopeVerses($session);
+        $verseIdMap = $orderedVerses->pluck('id')->values()->all();
+
+        DB::transaction(function () use ($validated, $questionMap, $verseIdMap) {
             foreach ($validated['answers'] as $answer) {
                 $question = $questionMap[$answer['question_id']];
-                $isCorrect = (int) $answer['selected_verse_id'] === (int) $question->verse_id;
+                $correctVerseId = $this->findNextVerseIdInOrderedScope($verseIdMap, (int) $question->verse_id);
+                $isCorrect = (int) $answer['selected_verse_id'] === (int) $correctVerseId;
 
                 $question->update([
                     'selected_verse_id' => $answer['selected_verse_id'],
@@ -296,21 +313,44 @@ class GameController extends Controller
         }
     }
 
-    private function buildOptions($scopedQuery, int $correctVerseId): array
+    private function getOrderedScopeVerses(GameSession $session): Collection
     {
-        $wrongIds = (clone $scopedQuery)
-            ->where('id', '!=', $correctVerseId)
-            ->inRandomOrder()
-            ->limit(3)
-            ->pluck('id')
+        $query = Verse::query();
+
+        $this->applyScope(
+            $query,
+            $session->mode,
+            isset($session->scope['juz']) ? (int) $session->scope['juz'] : null,
+            collect($session->scope['surah_ids'] ?? [])->map(fn ($id) => (int) $id)->all()
+        );
+
+        return $query->orderBy('id_chapter')->orderBy('number')->get()->values();
+    }
+
+    private function findNextVerseIdInOrderedScope(Collection|array $orderedVerses, int $currentVerseId): ?int
+    {
+        $verseIds = $orderedVerses instanceof Collection ? $orderedVerses->pluck('id')->values()->all() : array_values($orderedVerses);
+        $currentIndex = array_search($currentVerseId, $verseIds, true);
+
+        if ($currentIndex === false || !isset($verseIds[$currentIndex + 1])) {
+            return null;
+        }
+
+        return (int) $verseIds[$currentIndex + 1];
+    }
+
+    private function buildContinuationOptions(Collection $orderedVerses, int $promptVerseId, ?int $correctVerseId): array
+    {
+        $verseIds = $orderedVerses->pluck('id')->values()->all();
+        $wrongIds = collect($verseIds)
+            ->filter(fn ($verseId) => (int) $verseId !== $promptVerseId && (int) $verseId !== (int) $correctVerseId)
+            ->shuffle()
+            ->take(3)
             ->values();
 
         if ($wrongIds->count() < 3) {
-            $excludeIds = $wrongIds->all();
-            $excludeIds[] = $correctVerseId;
-
             $additional = Verse::query()
-                ->whereNotIn('id', $excludeIds)
+                ->whereNotIn('id', array_merge([$promptVerseId], $correctVerseId ? [$correctVerseId] : []))
                 ->inRandomOrder()
                 ->limit(3 - $wrongIds->count())
                 ->pluck('id');
@@ -318,7 +358,11 @@ class GameController extends Controller
             $wrongIds = $wrongIds->merge($additional)->values();
         }
 
-        return $wrongIds->push($correctVerseId)->shuffle()->values()->all();
+        if ($correctVerseId !== null) {
+            return $wrongIds->push($correctVerseId)->shuffle()->values()->all();
+        }
+
+        return $wrongIds->values()->all();
     }
 
     private function calculateResult(Collection $questions): array
