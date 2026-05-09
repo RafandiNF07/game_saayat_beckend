@@ -7,30 +7,14 @@ use App\Models\GameSessionQuestion;
 use App\Models\Leaderboard;
 use App\Models\UserProgress;
 use App\Models\Verse;
+use App\Models\Chapter;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 class GameService
 {
     /**
-     * Ambil ayat-ayat terurut sesuai scope (mode, juz, atau surah)
-     */
-    public function getOrderedScopeVerses(GameSession $session): Collection
-    {
-        $query = Verse::query();
-
-        $this->applyScope(
-            $query,
-            $session->mode,
-            isset($session->scope['juz']) ? (int) $session->scope['juz'] : null,
-            collect($session->scope['surah_ids'] ?? [])->map(fn ($id) => (int) $id)->all()
-        );
-
-        return $query->orderBy('id_chapter')->orderBy('number')->get()->values();
-    }
-
-    /**
-     * Terapkan filter scope berdasarkan mode
+     * Ambil ayat-ayat terurut sesuai scope
      */
     public function applyScope($query, string $mode, ?int $juzNumber, array $surahIds): void
     {
@@ -46,12 +30,11 @@ class GameService
     }
 
     /**
-     * Cari ayat berikutnya menggunakan query langsung, bukan array_search
-     * OPTIMASI: Hindari menarik seluruh koleksi ayat ke memory
+     * Cari ayat berikutnya dengan logika surah yang lebih robust
      */
     public function findNextVerseIdInScope(Verse $currentVerse, int $juzNumber = null, array $surahIds = []): ?int
     {
-        // Cari ayat di surah yang sama dengan nomor berikutnya
+        // 1. Coba cari di surah yang sama
         $nextVerse = Verse::where('id_chapter', $currentVerse->id_chapter)
             ->where('number', $currentVerse->number + 1)
             ->first(['id']);
@@ -60,15 +43,22 @@ class GameService
             return (int) $nextVerse->id;
         }
 
-        // Jika ayat terakhir di surah, cari ayat pertama surah berikutnya
-        $nextChapter = $currentVerse->chapter()
-            ->first()
-            ->where('juz_number', '>=', $currentVerse->chapter->juz_number ?? 0)
+        // 2. Jika ayat terakhir surah, cari surah berikutnya (hanya jika mode bukan surah tunggal)
+        $nextChapter = Chapter::where('id', '>', $currentVerse->id_chapter)
             ->orderBy('id')
-            ->skip(1)
-            ->first(['id']);
+            ->first(['id', 'juz_number']);
 
         if ($nextChapter) {
+            // Jika mode Juz, pastikan surah berikutnya masih di Juz yang sama
+            if ($juzNumber !== null && (int)$nextChapter->juz_number !== $juzNumber) {
+                return null;
+            }
+
+            // Jika mode Surah spesifik, pastikan surah berikutnya ada di daftar surah yang dipilih
+            if (!empty($surahIds) && !in_array($nextChapter->id, $surahIds)) {
+                return null;
+            }
+
             $firstVerse = Verse::where('id_chapter', $nextChapter->id)
                 ->where('number', 1)
                 ->first(['id']);
@@ -79,9 +69,6 @@ class GameService
         return null;
     }
 
-    /**
-     * Cari ayat berikutnya dari koleksi terurut (fallback untuk backward compatibility)
-     */
     public function findNextVerseIdInOrderedScope(Collection|array $orderedVerses, int $currentVerseId): ?int
     {
         $verseIds = $orderedVerses instanceof Collection ? $orderedVerses->pluck('id')->values()->all() : array_values($orderedVerses);
@@ -94,38 +81,25 @@ class GameService
         return (int) $verseIds[$currentIndex + 1];
     }
 
-    /**
-     * Bangun opsi pilihan ganda untuk pertanyaan lanjutan
-     * OPTIMASI: Hindari ORDER BY RAND() pada tabel besar
-     * Menggunakan LIMIT dengan offset acak atau ID range
-     */
     public function buildContinuationOptions(Collection $orderedVerses, int $promptVerseId, ?int $correctVerseId): array
     {
         $verseIds = $orderedVerses->pluck('id')->values()->all();
         
-        // Ambil 3 jawaban salah dari koleksi terurut yang sudah diambil
         $wrongIds = collect($verseIds)
             ->filter(fn ($verseId) => (int) $verseId !== $promptVerseId && (int) $verseId !== (int) ($correctVerseId ?? 0))
             ->shuffle()
             ->take(3)
             ->values();
 
-        // Jika jawaban salah kurang dari 3, ambil dari database dengan strategi yang lebih efisien
         if ($wrongIds->count() < 3) {
             $needed = 3 - $wrongIds->count();
             $excludeIds = array_merge([$promptVerseId], $correctVerseId ? [$correctVerseId] : []);
-            
-            // Daripada ORDER BY RAND(), gunakan offset random pada ID
             $additional = $this->getRandomVersesEfficiently($excludeIds, $needed);
             $wrongIds = $wrongIds->merge($additional)->unique()->values();
         }
 
-        // Susun 4 opsi dengan jawaban benar diacak di dalamnya
         if ($correctVerseId !== null) {
-            $options = $wrongIds->push($correctVerseId)
-                ->shuffle()
-                ->values()
-                ->all();
+            $options = $wrongIds->push($correctVerseId)->shuffle()->values()->all();
         } else {
             $options = $wrongIds->values()->all();
         }
@@ -133,38 +107,32 @@ class GameService
         return $options;
     }
 
-    /**
-     * Ambil verse secara random tanpa menggunakan ORDER BY RAND()
-     * Strategi: Ambil range ID verse, generate random ID dalam range, query dengan IN
-     * OPTIMASI: Jauh lebih cepat daripada ORDER BY RAND()
-     */
     private function getRandomVersesEfficiently(array $excludeIds, int $limit): Collection
     {
-        $minId = Verse::query()->min('id') ?? 1;
-        $maxId = Verse::query()->max('id') ?? 1;
+        $count = Verse::count();
+        if ($count === 0) return collect();
 
         $randomIds = [];
+        $maxId = Verse::max('id');
+        
+        // Strategi: Ambil sedikit lebih banyak ID random untuk antisipasi ID yang tidak ada
         $attempts = 0;
-        $maxAttempts = $limit * 5; // Hindari infinite loop
-
-        while (count($randomIds) < $limit && $attempts < $maxAttempts) {
-            $randomId = mt_rand($minId, $maxId);
-            
-            if (!in_array($randomId, $excludeIds) && !in_array($randomId, $randomIds)) {
-                $randomIds[] = $randomId;
+        while (count($randomIds) < $limit && $attempts < 50) {
+            $randId = mt_rand(1, $maxId);
+            if (!in_array($randId, $excludeIds) && !in_array($randId, $randomIds)) {
+                // Verifikasi keberadaan ID
+                if (Verse::where('id', $randId)->exists()) {
+                    $randomIds[] = $randId;
+                }
             }
-            
             $attempts++;
         }
 
-        // Query verse dengan ID random yang sudah dihasilkan
-        return Verse::whereIn('id', $randomIds)
-            ->pluck('id')
-            ->values();
+        return collect($randomIds);
     }
 
     /**
-     * Hitung hasil game (score, streak, combo)
+     * Hitung hasil dengan penalti untuk percobaan (attempts)
      */
     public function calculateResult(Collection $questions): array
     {
@@ -181,7 +149,17 @@ class GameService
                 $currentCombo++;
                 $currentStreak++;
 
-                $score += 100 + (($currentCombo - 1) * 20);
+                // Scoring logic: base 100, dikurangi penalti attempt
+                // attempt 1 = 100%, attempt 2 = 50%, attempt 3 = 25%, dst.
+                $basePoints = 100;
+                $penaltyMultiplier = 1.0;
+                if ($question->attempts > 1) {
+                    $penaltyMultiplier = pow(0.5, $question->attempts - 1);
+                }
+                
+                $earned = ($basePoints * $penaltyMultiplier) + (($currentCombo - 1) * 20);
+                $score += (int) $earned;
+                
                 $maxCombo = max($maxCombo, $currentCombo);
                 $maxStreak = max($maxStreak, $currentStreak);
             } else {
@@ -193,65 +171,45 @@ class GameService
         return [$score, $maxStreak, $maxCombo, $correctCount];
     }
 
-    /**
-     * Tandai progress sebagai passed untuk mode surah
-     */
     public function markProgressPassed(GameSession $session): void
     {
-        if ($session->mode !== 'surah') {
-            return;
-        }
+        if ($session->mode !== 'surah') return;
 
         $surahIds = collect($session->scope['surah_ids'] ?? [])->map(fn ($id) => (int) $id)->all();
 
         foreach ($surahIds as $surahId) {
             UserProgress::updateOrCreate(
                 ['user_id' => $session->user_id, 'chapter_id' => $surahId],
-                [
-                    'is_passed' => true,
-                    'last_played_at' => now(),
-                ]
+                ['is_passed' => true, 'last_played_at' => now()]
             );
         }
     }
 
-    /**
-     * Proses submission jawaban dan hitung skor
-     * OPTIMASI: Query ayat berikutnya langsung dari database, bukan dari array memory
-     */
-    public function processSubmitScore(array $answers, GameSession $session, GameSessionQuestion $questionMap): array
+    public function processSubmitScore(array $answers, GameSession $session, Collection $questionMap): void
     {
-        $results = [];
-
-        DB::transaction(function () use ($answers, $session, $questionMap, &$results) {
+        DB::transaction(function () use ($answers, $session, $questionMap) {
             foreach ($answers as $answer) {
-                $question = $questionMap[$answer['question_id']];
-                $currentVerse = Verse::find($question->verse_id);
+                $question = $questionMap->get($answer['question_id']);
+                if (!$question) continue;
 
-                // Query ayat berikutnya langsung dari database
+                $currentVerse = Verse::find($question->verse_id);
                 $correctVerseId = $this->findNextVerseIdInScope(
                     $currentVerse,
-                    isset($session->scope['juz']) ? (int) $session->scope['juz'] : null,
-                    collect($session->scope['surah_ids'] ?? [])->map(fn ($id) => (int) $id)->all()
+                    $session->scope['juz'] ?? null,
+                    $session->scope['surah_ids'] ?? []
                 );
 
                 $isCorrect = $correctVerseId !== null && (int) $answer['selected_verse_id'] === (int) $correctVerseId;
 
                 $question->update([
                     'selected_verse_id' => $answer['selected_verse_id'],
+                    'attempts' => $answer['attempts'] ?? 1,
                     'is_correct' => $isCorrect,
                 ]);
-
-                $results[] = ['question_id' => $question->id, 'is_correct' => $isCorrect];
             }
         });
-
-        return $results;
     }
 
-    /**
-     * Update leaderboard setelah game selesai
-     */
     public function updateLeaderboard(int $userId, int $score, int $maxStreak, int $maxCombo): Leaderboard
     {
         $leaderboard = Leaderboard::firstOrNew(['user_id' => $userId]);

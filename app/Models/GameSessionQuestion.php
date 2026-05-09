@@ -15,6 +15,7 @@ class GameSessionQuestion extends Model
         'verse_id',
         'option_verse_ids',
         'selected_verse_id',
+        'attempts',
         'is_correct',
     ];
 

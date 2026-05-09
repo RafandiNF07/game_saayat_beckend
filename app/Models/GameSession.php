@@ -15,6 +15,7 @@ class GameSession extends Model
         'scope',
         'question_count',
         'reciter_id',
+        'is_autoplay',
         'status',
         'started_at',
         'finished_at',
@@ -30,6 +31,7 @@ class GameSession extends Model
         'started_at' => 'datetime',
         'finished_at' => 'datetime',
         'is_perfect' => 'boolean',
+        'is_autoplay' => 'boolean',
     ];
 
     public function user()
