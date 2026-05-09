@@ -76,7 +76,10 @@ class GameController extends Controller
             ->get()
             ->values();
 
+        // Use slice to exclude last verse (which has no continuation)
+        // This is more lenient and handles edge cases better
         $eligiblePrompts = $orderedVerses->slice(0, max(0, $orderedVerses->count() - 1))->values();
+        
         $availableCount = $eligiblePrompts->count();
 
         if ($availableCount < $jumlahSoal) {
