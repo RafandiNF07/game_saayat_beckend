@@ -13,14 +13,14 @@ class LeaderboardResource extends JsonResource
         }
 
         return [
-            'id' => $this->id,
+            'id' => (int) $this->id,
             'user' => [
-                'id' => $this->user?->id,
+                'id' => (int) $this->user?->id,
                 'name' => $userName,
             ],
             'total_points' => (int) $this->total_points,
-            'max_streak' => $this->max_streak,
-            'max_combo' => $this->max_combo,
+            'max_streak' => (int) $this->max_streak,
+            'max_combo' => (int) $this->max_combo,
         ];
     }
 }

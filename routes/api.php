@@ -28,5 +28,7 @@ Route::middleware('auth:sanctum')->group(function () {
 Route::get('/game/leaderboard', [\App\Http\Controllers\API\GameController::class, 'getLeaderboard']);
 
 Route::get('chapters', [\App\Http\Controllers\ChapterController::class, 'index']);
+Route::get('chapters/{chapter}', [\App\Http\Controllers\ChapterController::class, 'show']);
+// Legacy route alias for backward compatibility
 Route::get('surah/{chapter}', [\App\Http\Controllers\ChapterController::class, 'show']);
 Route::get('audio/{id_reciter}/{id_chapter}/{verse_number}', [\App\Http\Controllers\ChapterController::class, 'getAudioVerse']);

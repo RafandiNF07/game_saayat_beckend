@@ -4,17 +4,24 @@ namespace App\Http\Controllers\API;
 
 use App\Http\Controllers\Controller;
 use App\Http\Resources\LeaderboardResource;
+use App\Http\Resources\GameSessionResource;
+use App\Http\Resources\GameSubmitResource;
 use App\Models\GameSession;
 use App\Models\GameSessionQuestion;
 use App\Models\Leaderboard;
-use App\Models\UserProgress;
 use App\Models\Verse;
+use App\Services\GameService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 class GameController extends Controller
 {
+    private GameService $gameService;
+
+    public function __construct(GameService $gameService)
+    {
+        $this->gameService = $gameService;
+    }
     public function startSession(Request $request)
     {
         $user = $request->user();
@@ -65,7 +72,7 @@ class GameController extends Controller
             'surah_ids' => $surahIds,
         ];
 
-        $this->applyScope($baseQuery, $mode, $juzNumber, $surahIds);
+        $this->gameService->applyScope($baseQuery, $mode, $juzNumber, $surahIds);
 
         $orderedVerses = (clone $baseQuery)
             ->with(['chapter', 'audio' => function ($q) use ($reciterId) {
@@ -107,8 +114,8 @@ class GameController extends Controller
             ]);
 
             foreach ($selectedVerses->values() as $index => $verse) {
-                $nextVerseId = $this->findNextVerseIdInOrderedScope($orderedVerses, $verse->id);
-                $optionVerseIds = $this->buildContinuationOptions($orderedVerses, $verse->id, $nextVerseId);
+                $nextVerseId = $this->gameService->findNextVerseIdInOrderedScope($orderedVerses, $verse->id);
+                $optionVerseIds = $this->gameService->buildContinuationOptions($orderedVerses, $verse->id, $nextVerseId);
 
                 GameSessionQuestion::create([
                     'game_session_id' => $session->id,
@@ -127,7 +134,7 @@ class GameController extends Controller
             ->get()
             ->map(function (GameSessionQuestion $question) use ($reciterId, $orderedVerses) {
                 $verse = $question->verse;
-                $nextVerseId = $this->findNextVerseIdInOrderedScope($orderedVerses, $verse->id);
+                $nextVerseId = $this->gameService->findNextVerseIdInOrderedScope($orderedVerses, $verse->id);
                 $promptTranslation = DB::table('verse_translations')->where('id_verse', $verse->id)->where('id_translation', 33)->value('text') ?? '';
                 $audioUrl = optional($verse->audio()->where('id_recitation', $reciterId)->first())->url;
 
@@ -167,12 +174,7 @@ class GameController extends Controller
 
         return response()->json([
             'status' => 'success',
-            'data' => [
-                'session_id' => $session->id,
-                'mode' => $mode,
-                'jumlah_soal' => $jumlahSoal,
-                'questions' => $responseQuestions,
-            ],
+            'data' => GameSessionResource::withQuestions($session, $responseQuestions),
         ]);
     }
 
@@ -231,28 +233,15 @@ class GameController extends Controller
             ], 422);
         }
 
-        $orderedVerses = $this->getOrderedScopeVerses($session);
-        $verseIdMap = $orderedVerses->pluck('id')->values()->all();
-
-        DB::transaction(function () use ($validated, $questionMap, $verseIdMap) {
-            foreach ($validated['answers'] as $answer) {
-                $question = $questionMap[$answer['question_id']];
-                $correctVerseId = $this->findNextVerseIdInOrderedScope($verseIdMap, (int) $question->verse_id);
-                $isCorrect = (int) $answer['selected_verse_id'] === (int) $correctVerseId;
-
-                $question->update([
-                    'selected_verse_id' => $answer['selected_verse_id'],
-                    'is_correct' => $isCorrect,
-                ]);
-            }
-        });
+        // OPTIMASI: Gunakan GameService untuk processing submission dengan query-level optimization
+        $this->gameService->processSubmitScore($validated['answers'], $session, $questionMap);
 
         $resolvedQuestions = GameSessionQuestion::query()
             ->where('game_session_id', $session->id)
             ->orderBy('question_order')
             ->get();
 
-        [$score, $maxStreak, $maxCombo, $correctCount] = $this->calculateResult($resolvedQuestions);
+        [$score, $maxStreak, $maxCombo, $correctCount] = $this->gameService->calculateResult($resolvedQuestions);
         $isPerfect = $correctCount === (int) $session->question_count;
 
         $session->update([
@@ -266,28 +255,15 @@ class GameController extends Controller
         ]);
 
         if ($isPerfect) {
-            $this->markProgressPassed($session);
+            $this->gameService->markProgressPassed($session);
         }
 
-        $leaderboard = Leaderboard::firstOrNew(['user_id' => $user->id]);
-        $leaderboard->total_points = (int) $leaderboard->total_points + $score;
-        $leaderboard->max_streak = max((int) $leaderboard->max_streak, $maxStreak);
-        $leaderboard->max_combo = max((int) $leaderboard->max_combo, $maxCombo);
-        $leaderboard->save();
+        $leaderboard = $this->gameService->updateLeaderboard($user->id, $score, $maxStreak, $maxCombo);
 
         return response()->json([
             'status' => 'success',
             'message' => 'Skor berhasil disimpan.',
-            'data' => [
-                'session_id' => $session->id,
-                'score' => $score,
-                'correct_count' => $correctCount,
-                'total_questions' => (int) $session->question_count,
-                'max_streak' => $maxStreak,
-                'max_combo' => $maxCombo,
-                'is_perfect' => $isPerfect,
-                'total_points' => (int) $leaderboard->total_points,
-            ],
+            'data' => GameSubmitResource::withTotalPoints($session, (int) $leaderboard->total_points),
         ]);
     }
 
@@ -303,117 +279,6 @@ class GameController extends Controller
         ]);
     }
 
-    private function applyScope($query, string $mode, ?int $juzNumber, array $surahIds): void
-    {
-        if ($mode === 'juz') {
-            $query->whereHas('chapter', function ($q) use ($juzNumber) {
-                $q->where('juz_number', $juzNumber);
-            });
-        }
-
-        if ($mode === 'surah') {
-            $query->whereIn('id_chapter', $surahIds);
-        }
-    }
-
-    private function getOrderedScopeVerses(GameSession $session): Collection
-    {
-        $query = Verse::query();
-
-        $this->applyScope(
-            $query,
-            $session->mode,
-            isset($session->scope['juz']) ? (int) $session->scope['juz'] : null,
-            collect($session->scope['surah_ids'] ?? [])->map(fn ($id) => (int) $id)->all()
-        );
-
-        return $query->orderBy('id_chapter')->orderBy('number')->get()->values();
-    }
-
-    private function findNextVerseIdInOrderedScope(Collection|array $orderedVerses, int $currentVerseId): ?int
-    {
-        $verseIds = $orderedVerses instanceof Collection ? $orderedVerses->pluck('id')->values()->all() : array_values($orderedVerses);
-        $currentIndex = array_search($currentVerseId, $verseIds, true);
-
-        if ($currentIndex === false || !isset($verseIds[$currentIndex + 1])) {
-            return null;
-        }
-
-        return (int) $verseIds[$currentIndex + 1];
-    }
-
-    private function buildContinuationOptions(Collection $orderedVerses, int $promptVerseId, ?int $correctVerseId): array
-    {
-        $verseIds = $orderedVerses->pluck('id')->values()->all();
-        $wrongIds = collect($verseIds)
-            ->filter(fn ($verseId) => (int) $verseId !== $promptVerseId && (int) $verseId !== (int) $correctVerseId)
-            ->shuffle()
-            ->take(3)
-            ->values();
-
-        if ($wrongIds->count() < 3) {
-            $additional = Verse::query()
-                ->whereNotIn('id', array_merge([$promptVerseId], $correctVerseId ? [$correctVerseId] : []))
-                ->inRandomOrder()
-                ->limit(3 - $wrongIds->count())
-                ->pluck('id');
-
-            $wrongIds = $wrongIds->merge($additional)->values();
-        }
-
-        if ($correctVerseId !== null) {
-            return $wrongIds->push($correctVerseId)->shuffle()->values()->all();
-        }
-
-        return $wrongIds->values()->all();
-    }
-
-    private function calculateResult(Collection $questions): array
-    {
-        $score = 0;
-        $correctCount = 0;
-        $currentCombo = 0;
-        $currentStreak = 0;
-        $maxCombo = 0;
-        $maxStreak = 0;
-
-        foreach ($questions as $question) {
-            if ($question->is_correct) {
-                $correctCount++;
-                $currentCombo++;
-                $currentStreak++;
-
-                $score += 100 + (($currentCombo - 1) * 20);
-                $maxCombo = max($maxCombo, $currentCombo);
-                $maxStreak = max($maxStreak, $currentStreak);
-            } else {
-                $currentCombo = 0;
-                $currentStreak = 0;
-            }
-        }
-
-        return [$score, $maxStreak, $maxCombo, $correctCount];
-    }
-
-    private function markProgressPassed(GameSession $session): void
-    {
-        if ($session->mode !== 'surah') {
-            return;
-        }
-
-        $surahIds = collect($session->scope['surah_ids'] ?? [])->map(fn ($id) => (int) $id)->all();
-
-        foreach ($surahIds as $surahId) {
-            UserProgress::updateOrCreate(
-                ['user_id' => $session->user_id, 'chapter_id' => $surahId],
-                [
-                    'is_passed' => true,
-                    'last_played_at' => now(),
-                ]
-            );
-        }
-    }
-
     private function findBlockedChapter(int $userId, array $surahIds): ?int
     {
         $orderedSurahIds = collect($surahIds)->sort()->values();
@@ -425,7 +290,7 @@ class GameController extends Controller
 
             $prevChapterId = $chapterId - 1;
 
-            $passed = UserProgress::query()
+            $passed = \App\Models\UserProgress::query()
                 ->where('user_id', $userId)
                 ->where('chapter_id', $prevChapterId)
                 ->where('is_passed', true)
